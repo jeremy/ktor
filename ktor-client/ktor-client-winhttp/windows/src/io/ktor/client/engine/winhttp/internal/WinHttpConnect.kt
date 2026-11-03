@@ -5,6 +5,7 @@
 package io.ktor.client.engine.winhttp.internal
 
 import io.ktor.http.*
+import io.ktor.util.collections.*
 import io.ktor.utils.io.core.*
 import kotlinx.atomicfu.*
 import kotlinx.cinterop.*
@@ -21,7 +22,8 @@ internal class WinHttpConnect(
 
     private val closed = atomic(false)
 
-    val handlers = mutableMapOf<UInt, WinHttpStatusHandler>()
+    // Operations register handlers while WinHTTP callback threads read them and close() clears them.
+    val handlers = ConcurrentMap<UInt, WinHttpStatusHandler>()
 
     val isClosed: Boolean
         get() = closed.value

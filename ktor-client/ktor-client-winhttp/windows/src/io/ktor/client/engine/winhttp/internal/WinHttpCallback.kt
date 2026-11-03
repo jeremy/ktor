@@ -4,6 +4,7 @@
 
 package io.ktor.client.engine.winhttp.internal
 
+import kotlinx.atomicfu.*
 import kotlinx.cinterop.*
 import platform.windows.*
 import platform.windows.HINTERNET
@@ -18,7 +19,8 @@ internal enum class WinHttpCallbackStatus(val value: UInt) {
     WriteComplete(WINHTTP_CALLBACK_STATUS_WRITE_COMPLETE.convert<UInt>()),
     RequestError(WINHTTP_CALLBACK_STATUS_REQUEST_ERROR.convert<UInt>()),
     SendRequestComplete(WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE.convert<UInt>()),
-    CloseComplete(WINHTTP_CALLBACK_STATUS_CLOSE_COMPLETE.convert<UInt>())
+    CloseComplete(WINHTTP_CALLBACK_STATUS_CLOSE_COMPLETE.convert<UInt>()),
+    HandleClosing(WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING.convert<UInt>())
 }
 
 @OptIn(ExperimentalForeignApi::class)
@@ -32,10 +34,46 @@ internal fun winHttpCallback(
 ) {
     val contextPtr = dwContext.toLong().toCPointer<COpaque>() ?: return
 
-    val connect = contextPtr.asStableRef<WinHttpConnect>().get()
-    if (connect.isClosed) {
+    val context = contextPtr.asStableRef<WinHttpHandleContext>().get()
+    if (dwStatus == WinHttpCallbackStatus.HandleClosing.value) {
+        context.dispose()
+        return
+    }
+
+    val connect = context.connect
+    if (context.isClosed || connect.isClosed) {
         return
     }
 
     connect.handlers[dwStatus]?.invoke(statusInfo, statusInfoLength)
+}
+
+/**
+ * The context of a single WinHTTP handle, passed back to [winHttpCallback] with every status of that handle.
+ *
+ * WinHTTP keeps calling back after `WinHttpCloseHandle` returns, for example to complete
+ * a WebSocket receive cancelled by the close, so the context must outlive the close.
+ * It is disposed on [WinHttpCallbackStatus.HandleClosing], the last status WinHTTP sends for a handle.
+ */
+@OptIn(ExperimentalForeignApi::class)
+internal class WinHttpHandleContext(val connect: WinHttpConnect) {
+    private val reference = StableRef.create(this)
+    private val closed = atomic(false)
+
+    val pointer: Long
+        get() = reference.asCPointer().rawValue.toLong()
+
+    /**
+     * Whether the handle was closed, after which its statuses are ignored.
+     */
+    val isClosed: Boolean
+        get() = closed.value
+
+    fun close() {
+        closed.value = true
+    }
+
+    fun dispose() {
+        reference.dispose()
+    }
 }

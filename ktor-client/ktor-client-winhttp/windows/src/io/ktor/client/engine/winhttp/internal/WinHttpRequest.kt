@@ -22,8 +22,6 @@ import platform.windows.SECURITY_FLAG_IGNORE_CERT_DATE_INVALID
 import platform.windows.SECURITY_FLAG_IGNORE_UNKNOWN_CA
 import platform.winhttp.*
 import kotlin.coroutines.CoroutineContext
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 @OptIn(ExperimentalForeignApi::class)
 internal class WinHttpRequest(
@@ -37,7 +35,7 @@ internal class WinHttpRequest(
     private val closed = atomic(false)
     private val requestClosed = atomic(false)
 
-    private val connectReference: StableRef<WinHttpConnect>
+    private val requestContext: WinHttpHandleContext
 
     private val attributes = data.attributes
 
@@ -45,7 +43,6 @@ internal class WinHttpRequest(
         val hConnect = WinHttpConnect(hSession, data.url.host, data.url.port.convert(), 0.convert())
             ?: throw getWinHttpException("Unable to create connection")
         connect = WinHttpConnect(hConnect)
-        connectReference = StableRef.create(connect)
 
         // Try using explicitly specified HTTP protocol version
         val protocolVersion = config.protocolVersion
@@ -57,6 +54,7 @@ internal class WinHttpRequest(
 
         hRequest = connect.openRequest(data.method, data.url, httpVersion)
             ?: throw getWinHttpException("Unable to open request")
+        requestContext = WinHttpHandleContext(connect)
 
         configureFeatures()
 
@@ -66,7 +64,8 @@ internal class WinHttpRequest(
             disableTlsVerification()
         }
 
-        configureStatusCallback(enable = true)
+        configureContext()
+        configureStatusCallback()
     }
 
     fun upgradeToWebSocket() {
@@ -88,11 +87,11 @@ internal class WinHttpRequest(
             }.joinToString("\r\n")
 
             connect.on(WinHttpCallbackStatus.SendRequestComplete) { _, _ ->
-                continuation.resume(Unit)
+                continuation.resumeOnce(Unit)
             }
 
             // Send request
-            val statePtr = connectReference.asCPointer().rawValue.toLong()
+            val statePtr = requestContext.pointer
             if (WinHttpSendRequest(
                     hRequest,
                     headersString,
@@ -117,7 +116,7 @@ internal class WinHttpRequest(
     suspend fun writeData(buffer: Pinned<ByteArray>, length: Int = buffer.get().size) {
         return closeableCoroutine(connect, ERROR_FAILED_TO_WRITE_REQUEST) { continuation ->
             connect.on(WinHttpCallbackStatus.WriteComplete) { _, _ ->
-                continuation.resume(Unit)
+                continuation.resumeOnce(Unit)
             }
 
             if (WinHttpWriteData(hRequest, buffer.addressOf(0), length.convert(), null) == 0) {
@@ -134,9 +133,9 @@ internal class WinHttpRequest(
             connect.on(WinHttpCallbackStatus.HeadersAvailable) { _, _ ->
                 try {
                     val responseData = getResponseData()
-                    continuation.resume(responseData)
+                    continuation.resumeOnce(responseData)
                 } catch (cause: Exception) {
-                    continuation.resumeWithException(cause)
+                    continuation.resumeOnceWithException(cause)
                 }
             }
 
@@ -181,7 +180,7 @@ internal class WinHttpRequest(
         return closeableCoroutine(connect, ERROR_FAILED_TO_QUERY_DATA) { continuation ->
             connect.on(WinHttpCallbackStatus.DataAvailable) { statusInfo, _ ->
                 val dataSize = statusInfo!!.reinterpret<ULongVar>().pointed.value
-                continuation.resume(dataSize.convert())
+                continuation.resumeOnce(dataSize.convert())
             }
 
             if (WinHttpQueryDataAvailable(hRequest, null) == 0) {
@@ -199,7 +198,7 @@ internal class WinHttpRequest(
     suspend fun readData(buffer: Pinned<ByteArray>, length: Int): Int {
         return closeableCoroutine(connect, ERROR_FAILED_TO_READ_RESPONSE) { continuation ->
             connect.on(WinHttpCallbackStatus.ReadComplete) { _, statusInfoLength ->
-                continuation.resume(statusInfoLength.convert())
+                continuation.resumeOnce(statusInfoLength.convert())
             }
 
             if (WinHttpReadData(hRequest, buffer.addressOf(0), length.convert(), null) == 0) {
@@ -215,9 +214,12 @@ internal class WinHttpRequest(
      */
     @OptIn(InternalAPI::class)
     fun createWebSocket(callContext: CoroutineContext): WinHttpWebSocket {
-        val statePtr = connectReference.asCPointer().rawValue.toLong()
-        val hWebsocket = WinHttpWebSocketCompleteUpgrade(hRequest, statePtr.convert())
-            ?: throw getWinHttpException("Unable to upgrade websocket")
+        val webSocketContext = WinHttpHandleContext(connect)
+        val hWebsocket = WinHttpWebSocketCompleteUpgrade(hRequest, webSocketContext.pointer.convert())
+        if (hWebsocket == null) {
+            webSocketContext.dispose()
+            throw getWinHttpException("Unable to upgrade websocket")
+        }
         val wsConfig = attributes[WEBSOCKETS_KEY]
 
         return WinHttpWebSocket(
@@ -248,15 +250,32 @@ internal class WinHttpRequest(
     }
 
     /**
-     * Receive status callbacks about all operations.
+     * Sets the context passed to the status callback for every status of the request handle,
+     * including [WinHttpCallbackStatus.HandleClosing], which may arrive before any request is sent.
      */
-    private fun configureStatusCallback(enable: Boolean) = memScoped {
-        val notifications = WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS.convert<UInt>()
-        val callback = if (enable) {
-            staticCFunction(::winHttpCallback)
-        } else {
-            null
+    private fun configureContext() = memScoped {
+        val context = alloc<ULongVar> {
+            value = requestContext.pointer.convert()
         }
+
+        if (WinHttpSetOption(
+                hRequest,
+                WINHTTP_OPTION_CONTEXT_VALUE.convert(),
+                context.ptr,
+                sizeOf<ULongVar>().convert()
+            ) == 0
+        ) {
+            throw getWinHttpException("Unable to set request context")
+        }
+    }
+
+    /**
+     * Receive status callbacks about all operations and about closing handles.
+     * The callback stays registered until the handle is closed, so that the handle context can be disposed.
+     */
+    private fun configureStatusCallback() {
+        val notifications = (WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS or WINHTTP_CALLBACK_FLAG_HANDLES).convert<UInt>()
+        val callback = staticCFunction(::winHttpCallback)
 
         val oldStatusCallback = WinHttpSetStatusCallback(hRequest, callback, notifications, 0.convert())
         if (oldStatusCallback?.rawValue?.toLong() == WINHTTP_INVALID_STATUS_CALLBACK) {
@@ -350,7 +369,7 @@ internal class WinHttpRequest(
     private fun closeRequest() {
         if (!requestClosed.compareAndSet(expect = false, update = true)) return
 
-        configureStatusCallback(enable = false)
+        requestContext.close()
         WinHttpCloseHandle(hRequest)
     }
 
@@ -359,8 +378,6 @@ internal class WinHttpRequest(
 
         closeRequest()
         connect.close()
-
-        connectReference.dispose()
     }
 
     companion object {

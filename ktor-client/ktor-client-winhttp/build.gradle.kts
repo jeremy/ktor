@@ -22,6 +22,7 @@ kotlin {
             implementation(projects.ktorClientTestBase)
             implementation(projects.ktorClientLogging)
             implementation(projects.ktorClientJson)
+            implementation(projects.ktorNetwork)
         }
     }
 }

@@ -18,8 +18,6 @@ import kotlinx.coroutines.launch
 import platform.windows.NULL
 import platform.winhttp.*
 import kotlin.coroutines.CoroutineContext
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 private object WinHttpWebSocketBuffer {
     val BinaryMessage = WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE
@@ -99,10 +97,10 @@ internal class WinHttpWebSocket(
             connect.on(WinHttpCallbackStatus.ReadComplete) { statusInfo, _ ->
                 if (statusInfo == null) {
                     val exception = IllegalStateException(ERROR_FAILED_TO_RECEIVE_FRAME)
-                    continuation.resumeWithException(exception)
+                    continuation.resumeOnceWithException(exception)
                 } else {
                     val status = statusInfo.reinterpret<WINHTTP_WEB_SOCKET_STATUS>().pointed
-                    continuation.resume(
+                    continuation.resumeOnce(
                         WinHttpWebSocketStatus(
                             bufferType = status.eBufferType,
                             size = status.dwBytesTransferred.toInt()
@@ -122,7 +120,7 @@ internal class WinHttpWebSocket(
                 ) != 0u &&
                 continuation.isActive
             ) {
-                continuation.resume(null)
+                continuation.resumeOnce(null)
                 return@closeableCoroutine
             }
         }
@@ -201,7 +199,7 @@ internal class WinHttpWebSocket(
     ) {
         return closeableCoroutine(connect, "") { continuation ->
             connect.on(WinHttpCallbackStatus.WriteComplete) { _, _ ->
-                continuation.resume(Unit)
+                continuation.resumeOnce(Unit)
             }
 
             val data = if (buffer.get().isEmpty()) null else buffer.addressOf(0)
